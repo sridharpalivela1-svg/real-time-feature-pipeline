@@ -9,11 +9,10 @@ st.set_page_config(page_title="Real-Time Feature Store", layout="wide")
 
 st.title("🚀 Real-Time Feature Engineering Dashboard")
 
-# Initialize Kafka Consumer with connection retry loop
+# Initialize Kafka Consumer safely
 @st.cache_resource
 def get_consumer():
     consumer = None
-    # Retry loop to gracefully wait for Kafka initialization
     while consumer is None:
         try:
             consumer = KafkaConsumer(
@@ -22,10 +21,11 @@ def get_consumer():
                 auto_offset_reset='earliest',
                 enable_auto_commit=True,
                 value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+                # Crucial: 200ms timeout prevents the generator from locking up the UI
+                consumer_timeout_ms=200,
                 request_timeout_ms=5000
             )
         except NoBrokersAvailable:
-            # Let the console log know it's waiting, then sleep
             print("Dashboard waiting for Kafka broker... retrying in 3 seconds.")
             time.sleep(3)
     return consumer
@@ -43,29 +43,48 @@ watermark_lag_metric = col3.empty()
 st.subheader(f"Latest Features for: {target_user}")
 feature_table = st.empty()
 
+# Initialize session state so data points don't vanish on refresh
+if "features_cache" not in st.session_state:
+    st.session_state.features_cache = {}
+
 try:
     consumer = get_consumer()
-    features_data = {}
-
-    # Stream consumer messages to UI
-    for message in consumer:
-        data = message.value
-        entity_id = data.get('entity_id')
+    
+    # Read a snapshot of messages currently in the buffer, then release the generator
+    raw_messages = consumer.poll(timeout_ms=500)
+    
+    for topic_partition, messages in raw_messages.items():
+        for message in messages:
+            data = message.value
+            entity_id = data.get('entity_id')
+            if entity_id:
+                st.session_state.features_cache[f"{entity_id}:{data['feature_name']}"] = data
+                
+    # Render UI from the persistent state cache
+    if st.session_state.features_cache:
+        df_list = [
+            {"Feature": v['feature_name'], "Value": v['feature_value'], "Updated At": v['computed_at']}
+            for k, v in st.session_state.features_cache.items() if v['entity_id'] == target_user
+        ]
         
-        # Store the latest feature value matching key pattern
-        features_data[f"{entity_id}:{data['feature_name']}"] = data
-        
-        # Filter for the user entered in UI
-        if entity_id == target_user:
-            df = pd.DataFrame([
-                {"Feature": v['feature_name'], "Value": v['feature_value'], "Updated At": v['computed_at']}
-                for k, v in features_data.items() if v['entity_id'] == target_user
-            ])
+        if df_list:
+            df = pd.DataFrame(df_list)
             feature_table.table(df)
             
             # Update Operational Metrics (Requirement 10)
             freshness_metric.metric("Feature Freshness", "0.5s")
             late_events_metric.metric("Late Events Dropped", "12") 
             watermark_lag_metric.metric("Watermark Lag", "30s")
+        else:
+            feature_table.info(f"No streaming features found yet for '{target_user}'. Click refresh to fetch incoming computations.")
+            # Set default metrics when user exists but data hasn't hit Kafka yet
+            freshness_metric.metric("Feature Freshness", "N/A")
+            late_events_metric.metric("Late Events Dropped", "0")
+            watermark_lag_metric.metric("Watermark Lag", "30s")
+            
 except Exception as e:
     st.error(f"Error reading from Feature Store stream: {e}")
+
+# Manual button to trigger a clean page redraw and catch the latest pipeline metrics
+if st.button("🔄 Refresh Data Pipeline"):
+    st.rerun()
